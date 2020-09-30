@@ -82,9 +82,14 @@ If nil Emacs will reattach itself to the process on entering downloads list."
   :type 'directory
   :group 'aria2)
 
-(defcustom aria2-rcp-listen-port 6800
-  "Port on which JSON RCP server will listen."
+(defcustom aria2-rpc-listen-port 6800
+  "Port on which JSON RPC server will listen."
   :type '(integer :tag "Http port")
+  :group 'aria2)
+
+(defcustom aria2-rpc-listen-host "aria2host"
+  "Host on which JSON RPC server will listen."
+  :type '(integer :tag "Http host")
   :group 'aria2)
 
 (defcustom aria2-custom-args nil
@@ -156,7 +161,7 @@ If nil Emacs will reattach itself to the process on entering downloads list."
 
 (defsubst aria2--url ()
   "Format URL."
-  (format "http://localhost:%d/jsonrpc" aria2-rcp-listen-port))
+  (format "http://%s:%d/jsonrpc" aria2-rpc-listen-host aria2-rpc-listen-port))
 
 (defun aria2--base64-encode-file (path)
   "Return base64-encoded string with contents of file on PATH."
@@ -164,7 +169,7 @@ If nil Emacs will reattach itself to the process on entering downloads list."
     (signal 'aria2-err-file-doesnt-exist '(path)))
   (with-current-buffer (find-file-noselect path)
     (unwind-protect
-        (base64-encode-string (buffer-string) t)
+        (base64-encode-string (encode-coding-string (buffer-string) 'raw-text) t)
       (kill-buffer))))
 
 ;; Before Emacs 26 `process-attributes' is not supported on Darwin.
@@ -240,7 +245,7 @@ If nil Emacs will reattach itself to the process on entering downloads list."
                :initform 0
                :type integer
                :docstring "Value of id field in JSONRPC data, gets incremented for each request.")
-   (rcp-url :initarg :rcp-url
+   (rpc-url :initarg :rpc-url
             :initform (aria2--url)
             :type string
             :docstring "Url on which aria2c listens for JSON RPC requests.")
@@ -286,7 +291,7 @@ If nil Emacs will reattach itself to the process on entering downloads list."
                           `("-D" ;; Start in daemon mode (won't be managed by Emacs).
                             "--enable-rpc=true"
                             ,(format "--rpc-secret=%s" (oref this secret))
-                            ,(format "--rpc-listen-port=%s" aria2-rcp-listen-port)
+                            ,(format "--rpc-listen-port=%s" aria2-rpc-listen-port)
                             ,(format "--dir=%s" aria2-download-directory)
                             ,(format "--save-session=%s" aria2-session-file)
                             ,(when (file-exists-p aria2-session-file)
@@ -303,7 +308,6 @@ If nil Emacs will reattach itself to the process on entering downloads list."
 
 (defmethod make-request ((this aria2-controller) method &rest params)
   "Calls a remote METHOD with PARAMS. Returns response alist."
-  (run-process this)
   (let ((url-request-method "POST")
         (url-request-data (json-encode-alist
                            (list
@@ -317,22 +321,29 @@ If nil Emacs will reattach itself to the process on entering downloads list."
         url-history-track
         json-response)
     (when aria2--debug (message "SEND: %s" url-request-data))
-    (with-current-buffer (url-retrieve-synchronously (oref this rcp-url) t)
-      ;; read last line, where json response is
-      (goto-char (point-max))
-      (beginning-of-line)
-      (setq json-response (json-read))
-      (kill-buffer))
-    (when aria2--debug (message "RECV: %s" json-response))
-    (or (alist-get 'result json-response)
-        (error "ERROR: %s" (alist-get 'message (alist-get 'error json-response))))))
+    
+    (let* ((uri-string (oref this rpc-url))
+           html-text)
+      (with-current-buffer (url-retrieve-synchronously uri-string t)
+	(setq html-text (decode-coding-string (buffer-string) 'utf-8))
+        (setq json-response (json-read-from-string (car (last (split-string html-text "\n" t)))))
+        (when aria2--debug (message "RECV: %s" json-response))
+        (kill-buffer))
+      (or (alist-get 'result json-response)
+          (error "ERROR: %s" (alist-get 'message (alist-get 'error json-response))))
+      )
+    )
+  )
 
 ;;; Api implementation starts here
 
 (defmethod addUri ((this aria2-controller) urls)
   "Add a list of http/ftp/bittorrent URLS, pointing at the same file.
 When sending magnet link, URLS must have only one element."
-  (make-request this "aria2.addUri" (vconcat urls)))
+  (make-request this "aria2.addUri" (vconcat (mapcar
+                                              (lambda (item)
+                                                (url-encode-url (encode-coding-string item 'raw-text)))
+                                              urls))))
 
 (defmethod addTorrent ((this aria2-controller) path)
   "Add PATH pointing at a torrent file to download list."
@@ -862,12 +873,10 @@ With prefix remove all applicable downloads."
   (unless (file-executable-p aria2-executable)
     (signal 'aria2-err-no-executable nil))
   ;; try to load controller state from file
-  (unless aria2--cc
-    (condition-case nil
-        (setq aria2--cc (eieio-persistent-read aria2--cc-file aria2-controller))
-      (error (setq aria2--cc (make-instance aria2-controller
-                                            "aria2-controller"
-                                            :file aria2--cc-file)))))
+  (setq aria2--cc (make-instance aria2-controller
+                                 "aria2-controller"
+                                 :file aria2--cc-file))
+  
   ;; kill process or save state on exit
   (if aria2-kill-process-on-emacs-exit
       (add-hook 'kill-emacs-hook 'aria2--kill-on-exit)
